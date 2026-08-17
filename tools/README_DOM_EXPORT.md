@@ -19,8 +19,7 @@ No external libraries or AI tools are required.
 | Browser | Supported |
 |---|---|
 | Google Chrome | ✅ |
-| Mozilla Firefox | ✅ |
-| Apple Safari | ✅ |
+
 
 ---
 
