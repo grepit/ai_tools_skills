@@ -35,47 +35,84 @@ No external libraries or AI tools are required.
 5. Press Enter.
 6. The browser will download the rendered page DOM as `page.html`.
 
----
 
-# Chrome + Firefox + Safari
-
-Use this version for maximum browser compatibility.
-
-```javascript
-const html = document.documentElement.outerHTML;
-
-const blob = new Blob([html], { type: "text/html" });
-
-const url = URL.createObjectURL(blob);
-
-const a = document.createElement("a");
-a.href = url;
-a.download = "page.html";
-
-document.body.appendChild(a);
-a.click();
-
-document.body.removeChild(a);
-
-URL.revokeObjectURL(url);
-```
 
 ---
 
-# Chrome Only
-
-A shorter version that works reliably in Chrome.
+# Chrome 
 
 ```javascript
-const html = document.documentElement.outerHTML;
 
-const blob = new Blob([html], { type: "text/html" });
+(() => {
+  function snapshot(node) {
+    if (node.nodeType === Node.TEXT_NODE || node.nodeType === Node.COMMENT_NODE) {
+      return node.cloneNode(false);
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return null;
 
-const a = document.createElement("a");
-a.href = URL.createObjectURL(blob);
-a.download = "page.html";
+    const tag = node.tagName;
+    if (tag === "SCRIPT") return null;
+    if (tag === "META" && /content-security-policy/i.test(node.getAttribute("http-equiv") || "")) {
+      return null;
+    }
+    if (tag === "CANVAS") {
+      try {
+        const img = document.createElement("img");
+        img.src = node.toDataURL();
+        img.width = node.width;
+        img.height = node.height;
+        return img;
+      } catch (e) {
+        return node.cloneNode(false); // tainted canvas — export empty
+      }
+    }
 
-a.click();
+    const clone = node.cloneNode(false); // shallow: tag + attributes only
+
+    if (tag === "INPUT" && node.type !== "password") {
+      if (node.type === "checkbox" || node.type === "radio") {
+        node.checked ? clone.setAttribute("checked", "") : clone.removeAttribute("checked");
+      } else {
+        clone.setAttribute("value", node.value);
+      }
+    }
+    if (tag === "TEXTAREA") clone.textContent = node.value;
+    if (tag === "OPTION") {
+      node.selected ? clone.setAttribute("selected", "") : clone.removeAttribute("selected");
+    }
+
+    if (node.shadowRoot) {
+      const template = document.createElement("template");
+      template.setAttribute("shadowrootmode", node.shadowRoot.mode);
+      for (const child of node.shadowRoot.childNodes) {
+        const snapped = snapshot(child);
+        if (snapped) template.content.appendChild(snapped);
+      }
+      clone.appendChild(template);
+    }
+
+    for (const child of node.childNodes) {
+      const snapped = snapshot(child);
+      if (snapped) clone.appendChild(snapped);
+    }
+    return clone;
+  }
+
+  const root = snapshot(document.documentElement);
+  const head = root.querySelector("head") || root;
+  const base = document.createElement("base");
+  base.href = document.baseURI;
+  head.insertBefore(base, head.firstChild);
+
+  const html = "<!DOCTYPE html>\n" + root.outerHTML;
+  const blob = new Blob([html], { type: "text/html;charset=utf-8" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "snapshot.html";
+  a.click();
+  URL.revokeObjectURL(a.href);
+  console.log("saved");
+})();
 ```
 
 ---
