@@ -1,0 +1,654 @@
+(async () => {
+  /*
+   * ServiceNow complete Activity exporter
+   *
+   * Exports:
+   * - Additional comments
+   * - Work notes
+   * - Field changes
+   * - Related emails, if permitted
+   *
+   * Run this while the actual ServiceNow ticket is open.
+   */
+
+  const PAGE_SIZE = 500;
+
+  function escapeHtml(value) {
+    return String(value ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#039;");
+  }
+
+  function normalize(value) {
+    if (
+      value &&
+      typeof value === "object" &&
+      Object.prototype.hasOwnProperty.call(value, "display_value")
+    ) {
+      value = value.display_value ?? value.value ?? "";
+    }
+
+    return String(value ?? "")
+      .replace(/\r/g, "")
+      .replace(/\u00a0/g, " ")
+      .trim();
+  }
+
+  function getRecordInfo() {
+    const workspaceMatch = location.pathname.match(
+      /\/record\/([^/]+)\/([0-9a-f]{32})(?:\/|$)/i
+    );
+
+    if (workspaceMatch) {
+      return {
+        table: decodeURIComponent(workspaceMatch[1]),
+        sysId: workspaceMatch[2]
+      };
+    }
+
+    const classicMatch =
+      location.pathname.match(/\/([^/]+)\.do$/i);
+
+    const querySysId =
+      new URLSearchParams(location.search).get("sys_id");
+
+    if (
+      classicMatch &&
+      querySysId &&
+      /^[0-9a-f]{32}$/i.test(querySysId)
+    ) {
+      return {
+        table: classicMatch[1],
+        sysId: querySysId
+      };
+    }
+
+    const sysIdMatch =
+      location.href.match(/\b[0-9a-f]{32}\b/i);
+
+    return {
+      table: "incident",
+      sysId: sysIdMatch ? sysIdMatch[0] : null
+    };
+  }
+
+  /*
+   * Locate the current ServiceNow session token without displaying it.
+   */
+  function getUserToken() {
+    const possibleWindows = [
+      window,
+      window.top,
+      window.parent,
+      window.opener
+    ];
+
+    for (const candidate of possibleWindows) {
+      if (!candidate) continue;
+
+      try {
+        if (
+          typeof candidate.g_ck === "string" &&
+          candidate.g_ck.length > 10
+        ) {
+          return candidate.g_ck;
+        }
+      } catch (error) {
+        // Ignore inaccessible window contexts.
+      }
+    }
+
+    /*
+     * Some Next Experience pages carry the token in a meta element.
+     */
+    const tokenElement = document.querySelector(
+      [
+        'meta[name="csrf-token"]',
+        'meta[name="X-UserToken"]',
+        '[data-user-token]'
+      ].join(",")
+    );
+
+    if (tokenElement) {
+      return (
+        tokenElement.getAttribute("content") ||
+        tokenElement.getAttribute("data-user-token") ||
+        ""
+      );
+    }
+
+    return "";
+  }
+
+  const userToken = getUserToken();
+
+  if (!userToken) {
+    alert(
+      "The current ServiceNow session token was not found.\n\n" +
+      "Sign out and sign back in, reopen the ticket, and then run " +
+      "this script from the ticket page Console."
+    );
+
+    console.error(
+      "ServiceNow g_ck/X-UserToken was not available in this Console context."
+    );
+
+    return;
+  }
+
+  async function apiGet(table, query, fields) {
+    const records = [];
+    let offset = 0;
+
+    while (true) {
+      const parameters = new URLSearchParams({
+        sysparm_query: query,
+        sysparm_fields: fields,
+        sysparm_display_value: "all",
+        sysparm_exclude_reference_link: "true",
+        sysparm_limit: String(PAGE_SIZE),
+        sysparm_offset: String(offset)
+      });
+
+      const endpoint =
+        `/api/now/table/${encodeURIComponent(table)}?${parameters}`;
+
+      const response = await fetch(endpoint, {
+        method: "GET",
+        credentials: "include",
+        cache: "no-store",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "X-UserToken": userToken,
+          "X-Requested-With": "XMLHttpRequest"
+        }
+      });
+
+      if (!response.ok) {
+        const details = await response.text();
+
+        throw new Error(
+          `${table} returned HTTP ${response.status}: ` +
+          details.slice(0, 500)
+        );
+      }
+
+      const data = await response.json();
+      const page = Array.isArray(data.result)
+        ? data.result
+        : [];
+
+      records.push(...page);
+
+      if (page.length < PAGE_SIZE) {
+        break;
+      }
+
+      offset += PAGE_SIZE;
+    }
+
+    return records;
+  }
+
+  async function optionalApiGet(
+    table,
+    query,
+    fields,
+    failures
+  ) {
+    try {
+      return await apiGet(table, query, fields);
+    } catch (error) {
+      failures.push({
+        table,
+        message: error.message
+      });
+
+      console.warn(
+        `Unable to retrieve ${table}:`,
+        error
+      );
+
+      return [];
+    }
+  }
+
+  function formatDate(record) {
+    return normalize(
+      record.sys_created_on ||
+      record.sys_updated_on ||
+      record.sys_created_at
+    );
+  }
+
+  const recordInfo = getRecordInfo();
+
+  if (!recordInfo.sysId) {
+    alert(
+      "The ticket sys_id could not be found.\n\n" +
+      "Open the actual ServiceNow ticket and run the script again."
+    );
+
+    return;
+  }
+
+  console.log("Record detected:", recordInfo);
+  console.log("Session token detected: yes");
+
+  const failures = [];
+
+  /*
+   * Confirm that the current ServiceNow API session works.
+   */
+  let recordRows;
+
+  try {
+    recordRows = await apiGet(
+      recordInfo.table,
+      `sys_id=${recordInfo.sysId}`,
+      "number,short_description,sys_id"
+    );
+  } catch (error) {
+    console.error("Ticket API validation failed:", error);
+
+    alert(
+      "ServiceNow still rejected the authenticated request.\n\n" +
+      "Sign out, close all ServiceNow tabs, sign back in, reopen " +
+      "the ticket, and run the script again.\n\n" +
+      "See the Console for the exact response."
+    );
+
+    return;
+  }
+
+  const ticketRecord = recordRows[0] || {};
+
+  const ticketNumber =
+    normalize(ticketRecord.number) ||
+    recordInfo.sysId;
+
+  const shortDescription =
+    normalize(ticketRecord.short_description);
+
+  const journalRecords = await optionalApiGet(
+    "sys_journal_field",
+    [
+      `element_id=${recordInfo.sysId}`,
+      "elementINcomments,work_notes",
+      "ORDERBYsys_created_on"
+    ].join("^"),
+    [
+      "sys_id",
+      "element",
+      "value",
+      "sys_created_on",
+      "sys_created_by"
+    ].join(","),
+    failures
+  );
+
+  const auditRecords = await optionalApiGet(
+    "sys_audit",
+    [
+      `documentkey=${recordInfo.sysId}`,
+      "ORDERBYsys_created_on"
+    ].join("^"),
+    [
+      "sys_id",
+      "fieldname",
+      "oldvalue",
+      "newvalue",
+      "sys_created_on",
+      "user"
+    ].join(","),
+    failures
+  );
+
+  const emailRecords = await optionalApiGet(
+    "sys_email",
+    [
+      `instance=${recordInfo.sysId}`,
+      "ORDERBYsys_created_on"
+    ].join("^"),
+    [
+      "sys_id",
+      "type",
+      "subject",
+      "body_text",
+      "sys_created_on",
+      "user_id",
+      "recipients",
+      "copied"
+    ].join(","),
+    failures
+  );
+
+  const entries = [];
+
+  for (const record of journalRecords) {
+    const element = normalize(record.element);
+
+    entries.push({
+      type:
+        element === "work_notes"
+          ? "Work note"
+          : "Additional comment",
+      date: formatDate(record),
+      author: normalize(record.sys_created_by),
+      heading:
+        element === "work_notes"
+          ? "Work notes"
+          : "Additional comments",
+      content: normalize(record.value)
+    });
+  }
+
+  for (const record of auditRecords) {
+    const field = normalize(record.fieldname);
+    const oldValue = normalize(record.oldvalue);
+    const newValue = normalize(record.newvalue);
+
+    entries.push({
+      type: "Field change",
+      date: formatDate(record),
+      author: normalize(record.user),
+      heading: field || "Field updated",
+      content:
+        `Previous value:\n${oldValue || "(empty)"}\n\n` +
+        `New value:\n${newValue || "(empty)"}`
+    });
+  }
+
+  for (const record of emailRecords) {
+    const recipients = normalize(record.recipients);
+    const copied = normalize(record.copied);
+
+    const addressing = [
+      recipients ? `To: ${recipients}` : "",
+      copied ? `CC: ${copied}` : ""
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    entries.push({
+      type:
+        `Email ${normalize(record.type)}`.trim() ||
+        "Email",
+      date: formatDate(record),
+      author: normalize(record.user_id),
+      heading:
+        normalize(record.subject) || "Email",
+      content: [
+        addressing,
+        normalize(record.body_text)
+      ]
+        .filter(Boolean)
+        .join("\n\n")
+    });
+  }
+
+  entries.sort((first, second) => {
+    const firstDate = Date.parse(first.date);
+    const secondDate = Date.parse(second.date);
+
+    if (
+      Number.isNaN(firstDate) ||
+      Number.isNaN(secondDate)
+    ) {
+      return first.date.localeCompare(second.date);
+    }
+
+    return firstDate - secondDate;
+  });
+
+  if (!entries.length) {
+    console.table(failures);
+
+    alert(
+      "The ticket API connection worked, but no Activity records " +
+      "were available through the permitted tables.\n\n" +
+      "Review the Console warnings for any table that ServiceNow " +
+      "restricted."
+    );
+
+    return;
+  }
+
+  const activityHtml = entries
+    .map(
+      (entry, index) => `
+<section class="entry">
+  <div class="number">${index + 1}</div>
+
+  <div class="card">
+    <div class="header">
+      <span class="type">${escapeHtml(entry.type)}</span>
+      <span class="date">${escapeHtml(entry.date)}</span>
+    </div>
+
+    ${
+      entry.author
+        ? `<div class="author">${escapeHtml(entry.author)}</div>`
+        : ""
+    }
+
+    ${
+      entry.heading
+        ? `<h2>${escapeHtml(entry.heading)}</h2>`
+        : ""
+    }
+
+    <div class="body">${escapeHtml(entry.content)}</div>
+  </div>
+</section>`
+    )
+    .join("\n");
+
+  const restrictedTablesHtml = failures.length
+    ? `
+<section class="warning">
+  <strong>Not exported because ServiceNow denied access:</strong>
+  ${failures
+    .map(failure => escapeHtml(failure.table))
+    .join(", ")}
+</section>`
+    : "";
+
+  const outputHtml = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>${escapeHtml(ticketNumber)} Activity Export</title>
+
+<style>
+  body {
+    max-width: 1100px;
+    margin: 32px auto;
+    padding: 0 24px 60px;
+    color: #202124;
+    background: white;
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 14px;
+    line-height: 1.55;
+  }
+
+  .page-header {
+    margin-bottom: 24px;
+    padding-bottom: 16px;
+    border-bottom: 2px solid #d8dde6;
+  }
+
+  h1 {
+    margin: 0 0 6px;
+    font-size: 26px;
+  }
+
+  .description {
+    margin: 0 0 10px;
+    font-size: 15px;
+  }
+
+  .metadata {
+    color: #5f6368;
+    font-size: 12px;
+    overflow-wrap: anywhere;
+  }
+
+  .summary {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-bottom: 22px;
+  }
+
+  .summary span {
+    padding: 8px 12px;
+    background: #f1f3f4;
+    border-radius: 6px;
+  }
+
+  .warning {
+    margin-bottom: 22px;
+    padding: 12px 14px;
+    color: #6d4c00;
+    background: #fff4ce;
+    border: 1px solid #e5c365;
+    border-radius: 6px;
+  }
+
+  .entry {
+    display: grid;
+    grid-template-columns: 38px 1fr;
+    gap: 14px;
+    margin-bottom: 18px;
+    break-inside: avoid;
+  }
+
+  .number {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    color: white;
+    background: #4f5bd5;
+    border-radius: 50%;
+    font-weight: bold;
+  }
+
+  .card {
+    padding: 16px 18px;
+    border: 1px solid #d8dde6;
+    border-radius: 8px;
+  }
+
+  .header {
+    display: flex;
+    justify-content: space-between;
+    gap: 20px;
+    margin-bottom: 5px;
+  }
+
+  .type {
+    color: #3f51b5;
+    font-weight: bold;
+  }
+
+  .date {
+    color: #5f6368;
+    font-size: 12px;
+  }
+
+  .author {
+    margin-bottom: 8px;
+    font-weight: bold;
+  }
+
+  h2 {
+    margin: 8px 0;
+    font-size: 15px;
+  }
+
+  .body {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  @media print {
+    body {
+      max-width: none;
+      margin: 0;
+    }
+  }
+</style>
+</head>
+
+<body>
+<header class="page-header">
+  <h1>${escapeHtml(ticketNumber)} Activity</h1>
+
+  ${
+    shortDescription
+      ? `<p class="description">${escapeHtml(shortDescription)}</p>`
+      : ""
+  }
+
+  <div class="metadata">
+    Exported: ${escapeHtml(new Date().toLocaleString())}<br>
+    Record type: ${escapeHtml(recordInfo.table)}<br>
+    Record sys_id: ${escapeHtml(recordInfo.sysId)}
+  </div>
+</header>
+
+<div class="summary">
+  <span>Total: ${entries.length}</span>
+  <span>Comments/work notes: ${journalRecords.length}</span>
+  <span>Field changes: ${auditRecords.length}</span>
+  <span>Emails: ${emailRecords.length}</span>
+</div>
+
+${restrictedTablesHtml}
+
+<main>
+${activityHtml}
+</main>
+</body>
+</html>`;
+
+  const blob = new Blob(
+    [outputHtml],
+    { type: "text/html;charset=utf-8" }
+  );
+
+  const downloadUrl = URL.createObjectURL(blob);
+  const downloadLink = document.createElement("a");
+
+  downloadLink.href = downloadUrl;
+  downloadLink.download =
+    `${ticketNumber}_All_Activity_` +
+    `${new Date().toISOString().slice(0, 10)}.html`;
+
+  document.body.appendChild(downloadLink);
+  downloadLink.click();
+  downloadLink.remove();
+
+  setTimeout(
+    () => URL.revokeObjectURL(downloadUrl),
+    5000
+  );
+
+  console.log({
+    ticketNumber,
+    commentsAndWorkNotes: journalRecords.length,
+    fieldChanges: auditRecords.length,
+    emails: emailRecords.length,
+    totalExported: entries.length,
+    restrictedTables: failures.map(item => item.table)
+  });
+})();
