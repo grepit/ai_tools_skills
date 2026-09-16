@@ -1,0 +1,126 @@
+(() => {
+
+    const items = [...document.querySelectorAll('[data-tid="chat-pane-item"]')];
+
+    const messages = [];
+
+    items.forEach(item => {
+
+        const author =
+            item.querySelector('[data-tid="message-author-name"]')
+                ?.innerText?.trim() || '';
+
+        const message =
+            item.querySelector('[data-tid="chat-pane-message"]')
+                ?.innerText?.trim() || '';
+
+        if (!message) return;
+
+        let timestamp = '';
+
+        // Method 1: time element
+        const timeEl = item.querySelector('time');
+        if (timeEl) {
+            timestamp = timeEl.innerText || timeEl.dateTime || '';
+        }
+
+        // Method 2: aria-label
+        if (!timestamp) {
+            const ariaNodes = [...item.querySelectorAll('*')]
+                .map(e => e.getAttribute('aria-label'))
+                .filter(Boolean);
+
+            const match = ariaNodes.find(x =>
+                /\d{1,2}:\d{2}/.test(x)
+            );
+
+            if (match) timestamp = match;
+        }
+
+        // Method 3: title attribute
+        if (!timestamp) {
+            const titles = [...item.querySelectorAll('*')]
+                .map(e => e.title)
+                .filter(Boolean);
+
+            const match = titles.find(x =>
+                /\d{1,2}:\d{2}/.test(x)
+            );
+
+            if (match) timestamp = match;
+        }
+
+        messages.push({
+            author,
+            timestamp,
+            message
+        });
+
+    });
+
+    const html = `
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Teams Chat Export</title>
+<style>
+body{
+    font-family:Segoe UI, Arial, sans-serif;
+    max-width:1200px;
+    margin:40px auto;
+    background:#f4f4f4;
+}
+.msg{
+    background:white;
+    border:1px solid #ddd;
+    border-radius:8px;
+    padding:12px;
+    margin-bottom:10px;
+}
+.author{
+    font-weight:bold;
+    color:#444;
+}
+.time{
+    color:#666;
+    font-size:12px;
+    margin-top:2px;
+    margin-bottom:8px;
+}
+.message{
+    white-space:pre-wrap;
+}
+</style>
+</head>
+<body>
+
+<h1>Teams Chat Export</h1>
+<p>Generated ${new Date().toLocaleString()}</p>
+
+${messages.map(m => `
+<div class="msg">
+    <div class="author">${m.author || 'Unknown'}</div>
+    <div class="time">${m.timestamp || ''}</div>
+    <div class="message">${m.message
+        .replace(/</g,'&lt;')
+        .replace(/>/g,'&gt;')}</div>
+</div>
+`).join('')}
+
+</body>
+</html>
+`;
+
+    const blob = new Blob([html], {
+        type: 'text/html'
+    });
+
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = `teams-chat-${new Date().toISOString().slice(0,10)}.html`;
+    link.click();
+
+    console.log(`Exported ${messages.length} messages`);
+
+})();
